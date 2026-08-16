@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Generator, Optional
 
 from checkpoints import CheckpointManager
-from filters import NoiseFilter, extract_continuity_threads
+from filters import NoiseFilter, PIIRedactor, extract_continuity_threads
 from models import CompactionChunk, ContinuityThread, Decision, WorkProduct
 
 
@@ -110,14 +110,17 @@ class AgentSlurper:
 
     def _extract_signal(self, raw_content: str) -> dict:
         """Extract high-signal sections from raw content."""
+        # Redact PII before processing
+        redacted_content = PIIRedactor.redact(raw_content)
+
         # Filter noise
-        filtered = NoiseFilter.filter_log(raw_content)
+        filtered = NoiseFilter.filter_log(redacted_content)
 
         # Extract key content
         signal = NoiseFilter.extract_key_content(filtered)
 
         # Extract continuity threads
-        signal["threads"] = extract_continuity_threads(raw_content)
+        signal["threads"] = extract_continuity_threads(redacted_content)
 
         return signal
 

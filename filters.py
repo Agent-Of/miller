@@ -106,6 +106,43 @@ class NoiseFilter:
         return result
 
 
+class PIIRedactor:
+    """Detects and redacts personally identifiable information from logs."""
+
+    # Patterns for PII/secrets to redact
+    REDACTION_PATTERNS = [
+        # File paths: C:\Users\username\... or /Users/... or /home/...
+        (r"[A-Za-z]:\\Users\\[a-zA-Z0-9_.-]+", "{LOCAL_PATH}"),
+        (r"/Users/[a-zA-Z0-9_.-]+", "{LOCAL_PATH}"),
+        (r"/home/[a-zA-Z0-9_.-]+", "{LOCAL_PATH}"),
+        # Session IDs: UUID format (8-4-4-4-12 hex)
+        (r"\b[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b", "{SESSION_ID}"),
+        # API keys: common patterns like "Bearer ", "token=", "key=", "secret="
+        (r"(Bearer|token|key|secret|password)\s*=\s*['\"]?[A-Za-z0-9_-]{20,}['\"]?", r"\1={SECRET}"),
+        # Email addresses
+        (r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b", "{EMAIL}"),
+        # AWS-style credentials (AKIA...)
+        (r"\bAKIA[0-9A-Z]{16}\b", "{AWS_KEY}"),
+        # Generic secrets (40+ char hex strings often used for tokens)
+        (r"\b[a-f0-9]{40,}\b", "{SECRET_HEX}"),
+    ]
+
+    @staticmethod
+    def redact(content: str) -> str:
+        """Redact PII from content, replacing with generic placeholders."""
+        for pattern, replacement in PIIRedactor.REDACTION_PATTERNS:
+            content = re.sub(pattern, replacement, content, flags=re.IGNORECASE)
+        return content
+
+    @staticmethod
+    def contains_pii(content: str) -> bool:
+        """Check if content contains any detectable PII patterns."""
+        for pattern, _ in PIIRedactor.REDACTION_PATTERNS:
+            if re.search(pattern, content, flags=re.IGNORECASE):
+                return True
+        return False
+
+
 def extract_continuity_threads(content: str) -> list[str]:
     """Extract open threads that should continue to the next instance."""
     threads = []
