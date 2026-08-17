@@ -1,3 +1,17 @@
+> **Note (added during the JSONL-ingestion rewrite, Agent-Of/miller#3):**
+> This file is the original SOPHIA0-swarm agent-card describing MILLER's
+> intended role/dispatcher-protocol for that ecosystem. It predates, and is
+> not, a real installable Claude Code subagent definition — the frontmatter
+> fields below (`reasoning_effort`, `TaskUpdate` as a tool) don't match the
+> real, verified Claude Code subagent spec (`name`/`description` required;
+> optional `tools`/`model`/`permissionMode`/`maxTurns`/`color`; body is a
+> literal system prompt). **The real, installable subagent now lives at
+> [`.claude/agents/miller.md`](.claude/agents/miller.md)** — that's the one
+> to point Claude Code at (`.claude/agents/` is the documented, first-class
+> mechanism a repo uses to ship an agent). This file is kept as-is for
+> SOPHIA0-swarm historical/reference purposes, not deleted, since it may
+> still carry meaning in that separate context.
+
 ---
 name: miller
 model: claude-opus-5

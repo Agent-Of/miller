@@ -7,6 +7,21 @@
 
 ---
 
+> **Update (JSONL-ingestion rewrite, Agent-Of/miller#3):** the "Production-
+> ready" / "All 8 test cases passing" status above describes the pre-rewrite
+> version, whose actual test coverage was entirely a synthetic mock-data
+> format — no test exercised a real Claude Code session file, which is how
+> a core bug (never calling `json.loads` on session content; real session
+> files invisible to file-discovery) went uncaught. That bug is fixed as of
+> this rewrite: 11 tests now pass (8 original legacy-format + 3 new
+> real-JSONL), and the fix was additionally verified live against a real
+> 400+MB / ~118,000-event transcript with results cross-checked against an
+> independent tool. See `README.md` for current, accurate documentation —
+> treat this file as a historical snapshot of the original delivery, not
+> current status.
+
+---
+
 ## Deliverable Summary
 
 A complete Python streaming application that extracts high-signal content from agent compaction histories. Processes agent session logs across multiple compactions (👽[0..N]) and yields curated `CompactionChunk` objects via a generator pattern.

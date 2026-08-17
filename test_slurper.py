@@ -5,10 +5,21 @@ SOPHIA-class agents can use this to verify the implementation.
 """
 
 import json
+import sys
 import tempfile
 from pathlib import Path
 from slurper import create_slurper, AgentSlurper
 from models import CompactionChunk, Decision, WorkProduct
+from filters import NoiseFilter, PIIRedactor
+
+# On Windows, stdout defaults to the legacy console codepage (e.g. cp1252),
+# which cannot encode the emoji/checkmark characters this suite prints
+# (UnicodeEncodeError, crashing before any test result is shown). Reconfigure
+# to UTF-8 when available (Python 3.7+); harmless no-op on platforms where
+# stdout is already UTF-8. (Same fix as PR #4, carried into this branch too
+# since it was branched from main before #4 merged.)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
 def test_basic_slurping():
@@ -250,6 +261,160 @@ def test_clear_checkpoints():
     print("  ✓ Clear checkpoints passed")
 
 
+def _write_jsonl(path: Path, events: list[dict]):
+    with open(path, "w", encoding="utf-8") as f:
+        for event in events:
+            f.write(json.dumps(event) + "\n")
+
+
+def test_real_jsonl_discovered_and_parsed():
+    """Real fix for Agent-Of/miller#3: a real Claude-Code-shaped JSONL file,
+    named by session UUID (no 👽[N]/compaction_N/session_N in the filename),
+    must be discovered and correctly segmented by its own compact_boundary
+    events -- not by filename convention."""
+    print("Test 9: Real JSONL discovery + compaction-boundary segmentation...")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        agent_dir = Path(tmpdir) / "test_agent"
+        agent_dir.mkdir()
+        # Deliberately UUID-named, matching a real Claude Code session file --
+        # this exact filename would have raised "No compaction files found"
+        # against the pre-fix slurper.
+        session_file = agent_dir / "6ff45d9a-8628-4005-8063-402692a24a94.jsonl"
+
+        events = [
+            {
+                "type": "user", "uuid": "u1", "parentUuid": None,
+                "sessionId": "sess", "entrypoint": "cli",
+                "timestamp": "2026-08-17T10:00:00.000Z",
+                "message": {"role": "user", "content": "Decision: use pytest for the test suite."},
+            },
+            {
+                # A tool_use block whose JSON *input* contains signal-shaped
+                # substrings ("Accomplishment:", "completed") that must NOT
+                # be picked up as real signal -- this is the regression test
+                # for the original bug (979 false accomplishments on real
+                # data because raw JSON was substring-matched).
+                "type": "assistant", "uuid": "u2", "parentUuid": "u1",
+                "sessionId": "sess", "entrypoint": "cli",
+                "timestamp": "2026-08-17T10:00:05.000Z",
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Bash",
+                     "input": {"command": "echo done", "description": "Accomplishment: fake task completed"}},
+                ]},
+            },
+            {
+                "type": "assistant", "uuid": "u3", "parentUuid": "u2",
+                "sessionId": "sess", "entrypoint": "claude-vscode",
+                "timestamp": "2026-08-17T10:00:10.000Z",
+                "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "Learning: streaming JSON parsing works great.\nTODO: add a real test."},
+                ]},
+            },
+            {
+                "type": "system", "subtype": "compact_boundary",
+                "uuid": "b1", "parentUuid": None, "logicalParentUuid": "u3",
+                "sessionId": "sess", "entrypoint": "cli",
+                "timestamp": "2026-08-17T10:05:00.000Z",
+                "content": "Conversation compacted",
+                "compactMetadata": {
+                    "trigger": "auto", "preTokens": 5000, "postTokens": 500,
+                    "durationMs": 1200, "cumulativeDroppedTokens": 4500,
+                    "preservedMessages": {"anchorUuid": "u3", "uuids": ["u3"], "allUuids": ["u1", "u2", "u3"]},
+                    "preservedSegment": {"headUuid": "u1", "anchorUuid": "u3", "tailUuid": "u3"},
+                },
+            },
+            {
+                "type": "user", "uuid": "u4", "parentUuid": None,
+                "sessionId": "sess", "entrypoint": "cli",
+                "timestamp": "2026-08-17T10:06:00.000Z",
+                "message": {"role": "user", "content": "Accomplished: shipped the fix."},
+            },
+        ]
+        _write_jsonl(session_file, events)
+
+        slurper = create_slurper(str(agent_dir))
+        chunks = list(slurper.slurp(resume=False))
+
+        assert len(chunks) == 2, f"Expected 2 segments (1 boundary), got {len(chunks)}"
+
+        first, second = chunks
+        assert first.source_kind == "real_jsonl"
+        assert first.event_count == 3, f"Expected 3 events before the boundary, got {first.event_count}"
+        assert first.entrypoints == {"cli": 2, "claude-vscode": 1}, first.entrypoints
+        assert first.boundary_trigger == "auto"
+        assert first.tokens_pre == 5000 and first.tokens_post == 500
+        assert first.start_time is not None and first.end_time is not None
+
+        decision_texts = " ".join(d.decision for d in first.decisions)
+        assert "pytest" in decision_texts, f"Real decision text not captured: {decision_texts}"
+
+        learning_texts = " ".join(first.learnings)
+        assert "streaming JSON parsing" in learning_texts, f"Real learning not captured: {learning_texts}"
+
+        # The regression check: the tool_use input's "Accomplishment: fake
+        # task completed" must never appear anywhere in the extracted
+        # signal -- it's JSON structure, not prose.
+        all_accomplishments = " ".join(first.key_accomplishments) + " ".join(second.key_accomplishments)
+        assert "fake task" not in all_accomplishments, (
+            f"Tool-call JSON leaked into signal extraction: {all_accomplishments}"
+        )
+
+        assert second.source_kind == "real_jsonl"
+        assert second.boundary_trigger is None  # ended at EOF, not another boundary
+        assert "shipped the fix" in " ".join(second.key_accomplishments)
+
+    print("  ✓ Real JSONL discovery + segmentation passed")
+
+
+def test_real_jsonl_pii_redaction():
+    """PII redaction must work on real (json.loads-decoded) message text,
+    where a Windows path appears with single backslashes -- the original
+    LOCAL_PATH pattern only matched doubled backslashes and silently never
+    fired on real content (Agent-Of/miller#3)."""
+    print("Test 10: PII redaction on real decoded JSONL text...")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        agent_dir = Path(tmpdir) / "test_agent"
+        agent_dir.mkdir()
+        session_file = agent_dir / "11111111-2222-3333-4444-555555555555.jsonl"
+
+        real_path_text = r"Decision: write output to C:\Users\alice\project\out.txt"
+        events = [
+            {
+                "type": "user", "uuid": "u1", "parentUuid": None,
+                "sessionId": "sess", "entrypoint": "cli",
+                "timestamp": "2026-08-17T10:00:00.000Z",
+                "message": {"role": "user", "content": real_path_text},
+            },
+        ]
+        _write_jsonl(session_file, events)
+
+        slurper = create_slurper(str(agent_dir))
+        chunks = list(slurper.slurp(resume=False))
+        assert len(chunks) == 1
+        decision_texts = " ".join(d.decision for d in chunks[0].decisions)
+        assert "{LOCAL_PATH}" in decision_texts, f"Path was not redacted: {decision_texts}"
+        assert "alice" not in decision_texts, f"Username leaked past redaction: {decision_texts}"
+
+    print("  ✓ PII redaction on real content passed")
+
+
+def test_noise_patterns_actually_applied():
+    """NOISE_PATTERNS was defined but never referenced anywhere else in the
+    module (Agent-Of/miller#3) -- filter_log() only ever ran the separate
+    substring-keyword check. Verify the regex patterns are now wired in."""
+    print("Test 11: NOISE_PATTERNS regex patterns are actually applied...")
+
+    content = "Real signal line.\n<function_calls>\n<invoke>fake</invoke>\n</function_calls>\nMore signal."
+    filtered = NoiseFilter.filter_log(content)
+    assert "<invoke>fake</invoke>" not in filtered, f"Block-level noise pattern not applied: {filtered!r}"
+    assert "Real signal line." in filtered
+    assert "More signal." in filtered
+
+    print("  ✓ NOISE_PATTERNS wiring passed")
+
+
 def run_all_tests():
     """Run all tests."""
     print("\nAgent Slurper Test Suite")
@@ -264,6 +429,9 @@ def run_all_tests():
         test_chunk_summary,
         test_empty_directory,
         test_clear_checkpoints,
+        test_real_jsonl_discovered_and_parsed,
+        test_real_jsonl_pii_redaction,
+        test_noise_patterns_actually_applied,
     ]
 
     passed = 0

@@ -21,8 +21,11 @@ class NoiseFilter:
         r"<system-reminder>.*?</system-reminder>",
         r"<total_tokens>.*?</total_tokens>",
         # Connection/authentication logs
-        r"Authenticating.*?",
-        r"Connecting to.*?",
+        # (previously `.*?` with no trailing anchor here, which matches
+        # zero characters and only strips the literal keyword itself --
+        # anchored to end-of-line now that this is actually wired in)
+        r"Authenticating.*$",
+        r"Connecting to.*$",
         r"Session.*?established",
         # Token usage summaries
         r"Token usage:.*?$",
@@ -53,7 +56,19 @@ class NoiseFilter:
 
     @staticmethod
     def filter_log(content: str) -> str:
-        """Remove noise from log content while preserving signal."""
+        """Remove noise from log content while preserving signal.
+
+        Two passes: first the multi-line/regex NOISE_PATTERNS (block-level
+        noise like <function_calls>...</function_calls> that a single-line
+        keyword check can't see), then the per-line keyword check. Previously
+        NOISE_PATTERNS was defined but never applied anywhere -- this was a
+        real bug (found while dogfooding, Agent-Of/miller#3): the README's
+        "Tool invocation metadata" / "Bash execution details" removal claims
+        were not actually happening.
+        """
+        for pattern in NoiseFilter.NOISE_PATTERNS:
+            content = re.sub(pattern, "", content, flags=re.DOTALL | re.MULTILINE | re.IGNORECASE)
+
         lines = content.split("\n")
         filtered = []
 
@@ -112,7 +127,13 @@ class PIIRedactor:
     # Patterns for PII/secrets to redact
     REDACTION_PATTERNS = [
         # File paths: C:\Users\username\... or /Users/... or /home/...
-        (r"[A-Za-z]:\\Users\\[a-zA-Z0-9_.-]+", "{LOCAL_PATH}"),
+        # Matches 1-2 literal backslashes per separator: a single backslash
+        # after json.loads() has decoded a real session's escaped path text,
+        # or a doubled backslash if this ever runs against still-JSON-escaped
+        # raw text. The original single-backslash-only pattern silently
+        # never matched real (decoded) session content on Windows -- found
+        # while dogfooding against a real transcript (Agent-Of/miller#3).
+        (r"[A-Za-z]:\\{1,2}Users\\{1,2}[a-zA-Z0-9_.-]+", "{LOCAL_PATH}"),
         (r"/Users/[a-zA-Z0-9_.-]+", "{LOCAL_PATH}"),
         (r"/home/[a-zA-Z0-9_.-]+", "{LOCAL_PATH}"),
         # Session IDs: UUID format (8-4-4-4-12 hex)
