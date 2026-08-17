@@ -5,10 +5,19 @@ SOPHIA-class agents can use this to verify the implementation.
 """
 
 import json
+import sys
 import tempfile
 from pathlib import Path
 from slurper import create_slurper, AgentSlurper
 from models import CompactionChunk, Decision, WorkProduct
+
+# On Windows, stdout defaults to the legacy console codepage (e.g. cp1252),
+# which cannot encode the emoji/checkmark characters this suite prints
+# (UnicodeEncodeError, crashing before any test result is shown). Reconfigure
+# to UTF-8 when available (Python 3.7+); harmless no-op on platforms where
+# stdout is already UTF-8.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
 def test_basic_slurping():
