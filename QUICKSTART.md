@@ -8,7 +8,11 @@ Get the agent slurper running in 60 seconds.
 > needed. See `README.md`'s Quick Start for the real-session example; the
 > mock-data walkthrough below still works unchanged and is still a fast way
 > to sanity-check your install, but it is not what real usage looks like.
-> `test_slurper.py` now has 11 tests (8 legacy + 3 real-JSONL), not 8.
+> `test_slurper.py` now has 12 tests (8 legacy + 4 real-JSONL), not 8. If
+> pointing at a directory that holds multiple unrelated session files (a
+> real Claude Code project directory usually does), pass `session_id=` or
+> point directly at one `.jsonl` file to scope to a single session --
+> otherwise every top-level session in that directory is processed.
 
 ## 1. Verify Installation
 
@@ -31,7 +35,7 @@ Should print 3 compactions being processed and checkpoint status. Takes ~2 secon
 python test_slurper.py
 ```
 
-Should show: `Results: 11 passed, 0 failed`
+Should show: `Results: 12 passed, 0 failed`
 
 ## 4. Use in Your Code
 

@@ -40,6 +40,26 @@ A session can be large (real transcripts of hundreds of MB / 100k+ lines are
 normal for a long-running agent) — never try to load a whole file into one
 string or one tool-call's context. Stream it.
 
+**A project directory holds MANY sessions, not one — never treat "the
+project directory" as "the session."** `~/.claude/projects/<project>/`
+routinely contains several unrelated top-level `.jsonl` files (one per
+session ever run in that project, could span months, entirely unrelated
+conversations), PLUS a per-session sidecar subdirectory named after each
+session's own UUID (`<session-uuid>/subagents/*.jsonl`,
+`<session-uuid>/tool-results/...`) holding that session's subagent
+transcripts and tool outputs — internal plumbing, never additional
+top-level sessions in their own right. **This is not a hypothetical: a
+real, confirmed bug** (found by hands-on dogfooding of an earlier version
+of this very fix) came from exactly this — pointing the slurper at a whole
+project directory silently pooled ~8,000 extra events and a fabricated
+entrypoint value from unrelated sibling sessions and nested subagent
+transcripts into what was supposed to be one session's stats. When you
+mean one specific session (the overwhelmingly common case — "tell me about
+session X"), always either point directly at that session's `.jsonl` file,
+or pass `session_id="<uuid>"` to `create_slurper()` when you only have the
+directory. Only omit both when you deliberately want every top-level
+session in a directory processed (each still kept separate — see below).
+
 ## The real schema (verified directly against real transcripts, not assumed)
 
 Each line is one standalone JSON object. Malformed/truncated lines can occur
@@ -99,16 +119,19 @@ text-only signal extraction correctly:
 ```bash
 python3 -c "
 from slurper import create_slurper
-s = create_slurper('/path/to/dir/containing/the/session/file')
+# Point directly at the one session file you care about -- this and the
+# session_id= form below are equivalent and both scope to exactly one
+# session, never pooling in sibling sessions or subagent sidecar transcripts:
+s = create_slurper('/path/to/project-dir/<session-uuid>.jsonl')
+# s = create_slurper('/path/to/project-dir', session_id='<session-uuid>')
 for chunk in s.slurp(resume=False):
     print(chunk.compaction_label, chunk.source_kind, chunk.event_count,
           chunk.entrypoints, chunk.boundary_trigger, chunk.start_time, chunk.end_time)
 "
 ```
-(Point `create_slurper` at the *directory* containing the `.jsonl` file, not
-the file itself — it discovers real session files by content-sniffing, not
-by filename, so no renaming is ever needed.) Each yielded `chunk` also has
-`.decisions`, `.learnings`, `.key_accomplishments`, `.continuity_threads`,
+It discovers a real session file by content-sniffing, not by filename, so
+no renaming is ever needed. Each yielded `chunk` also has `.decisions`,
+`.learnings`, `.key_accomplishments`, `.continuity_threads`,
 `.work_products`, and a formatted `.summary()` — see `models.py` for the
 full field list, and `slurper.py`/`jsonl_events.py` for how each is
 derived, if you need to verify exactly what a field means before reporting

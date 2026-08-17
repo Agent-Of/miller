@@ -340,8 +340,14 @@ def test_real_jsonl_discovered_and_parsed():
 
         first, second = chunks
         assert first.source_kind == "real_jsonl"
-        assert first.event_count == 3, f"Expected 3 events before the boundary, got {first.event_count}"
-        assert first.entrypoints == {"cli": 2, "claude-vscode": 1}, first.entrypoints
+        # 4, not 3: the boundary event itself counts as the final event of
+        # the segment it closes (matches the "count every JSON line"
+        # convention of other tools, verified against session-ops.js on a
+        # real file -- an earlier version of this fix excluded the
+        # boundary event and was off by exactly the boundary count, found
+        # during the Org Lead's own dogfooding pass).
+        assert first.event_count == 4, f"Expected 4 events (3 + the closing boundary), got {first.event_count}"
+        assert first.entrypoints == {"cli": 3, "claude-vscode": 1}, first.entrypoints
         assert first.boundary_trigger == "auto"
         assert first.tokens_pre == 5000 and first.tokens_post == 500
         assert first.start_time is not None and first.end_time is not None
@@ -400,11 +406,103 @@ def test_real_jsonl_pii_redaction():
     print("  ✓ PII redaction on real content passed")
 
 
+def test_real_project_dir_ignores_sidecars_and_supports_scoping():
+    """Regression test for a real bug the Org Lead found during his own
+    dogfooding pass: a real Claude Code project directory holds several
+    unrelated top-level session files PLUS per-session sidecar
+    subdirectories (named after a session UUID) full of subagent
+    transcripts. The original real-JSONL fix still recursed into those
+    sidecar directories via os.walk and silently pooled every subagent
+    transcript's events/entrypoints into the total -- on the real session
+    this was built against, that meant ~8000 extra events and a
+    fabricated 'sdk-cli' entrypoint that didn't exist anywhere in the
+    target session, sourced from unrelated sibling sessions elsewhere in
+    the same project directory.
+
+    Two things must now hold: (1) real-session discovery never descends
+    into subdirectories at all, so sidecar/subagent transcripts are never
+    pooled in, regardless of scoping; (2) `session_id` lets a caller
+    scope to exactly one top-level session when a directory holds several.
+    """
+    print("Test 11: project-dir sidecar exclusion + session_id scoping...")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        agent_dir = Path(tmpdir) / "project"
+        agent_dir.mkdir()
+
+        target_id = "aaaaaaaa-1111-2222-3333-444444444444"
+        sibling_id = "bbbbbbbb-5555-6666-7777-888888888888"
+
+        target_events = [
+            {"type": "user", "uuid": "t1", "parentUuid": None, "sessionId": target_id,
+             "entrypoint": "cli", "timestamp": "2026-08-17T09:00:00.000Z",
+             "message": {"role": "user", "content": "Decision: target session content."}},
+            {"type": "assistant", "uuid": "t2", "parentUuid": "t1", "sessionId": target_id,
+             "entrypoint": "cli", "timestamp": "2026-08-17T09:00:01.000Z",
+             "message": {"role": "assistant", "content": [{"type": "text", "text": "Learning: target learning."}]}},
+        ]
+        _write_jsonl(agent_dir / f"{target_id}.jsonl", target_events)
+
+        sibling_events = [
+            {"type": "user", "uuid": "s1", "parentUuid": None, "sessionId": sibling_id,
+             "entrypoint": "claude-desktop", "timestamp": "2026-08-10T09:00:00.000Z",
+             "message": {"role": "user", "content": "Unrelated sibling session."}},
+        ]
+        _write_jsonl(agent_dir / f"{sibling_id}.jsonl", sibling_events)
+
+        # A sidecar subdirectory shaped exactly like real Claude Code's
+        # <session-uuid>/subagents/*.jsonl layout, carrying a fabricated
+        # entrypoint that must never appear in any result from this
+        # directory -- if it does, sidecar contamination has regressed.
+        sidecar_dir = agent_dir / target_id / "subagents"
+        sidecar_dir.mkdir(parents=True)
+        subagent_events = [
+            {"type": "assistant", "uuid": "sub1", "parentUuid": None, "sessionId": "sub-sess",
+             "entrypoint": "sdk-cli-should-never-appear", "timestamp": "2026-08-17T09:00:02.000Z",
+             "message": {"role": "assistant", "content": [{"type": "text", "text": "Accomplishment: subagent work."}]}},
+        ]
+        _write_jsonl(sidecar_dir / "agent-deadbeef.jsonl", subagent_events)
+
+        # Default (whole directory, no session_id): both top-level sessions,
+        # never the sidecar.
+        s_all = create_slurper(str(agent_dir))
+        chunks_all = list(s_all.slurp(resume=False))
+        all_entrypoints = {}
+        all_source_files = set()
+        for c in chunks_all:
+            for ep, n in c.entrypoints.items():
+                all_entrypoints[ep] = all_entrypoints.get(ep, 0) + n
+            all_source_files.update(c.source_files)
+
+        assert "sdk-cli-should-never-appear" not in all_entrypoints, (
+            f"Sidecar subagent transcript leaked into results: {all_entrypoints}"
+        )
+        assert len(all_source_files) == 2, f"Expected exactly the 2 top-level sessions, got {all_source_files}"
+        assert any("agent-deadbeef" in f for f in all_source_files) is False
+
+        # Scoped to just the target session_id: only that one file, exact match.
+        s_scoped = create_slurper(str(agent_dir), session_id=target_id)
+        chunks_scoped = list(s_scoped.slurp(resume=False))
+        assert len(chunks_scoped) == 1
+        scoped = chunks_scoped[0]
+        assert scoped.source_files == [str(agent_dir / f"{target_id}.jsonl")]
+        assert scoped.entrypoints == {"cli": 2}
+        assert scoped.event_count == 2
+
+        # Pointing directly at the target file also works, no scoping needed.
+        s_direct = create_slurper(str(agent_dir / f"{target_id}.jsonl"))
+        chunks_direct = list(s_direct.slurp(resume=False))
+        assert len(chunks_direct) == 1
+        assert chunks_direct[0].entrypoints == {"cli": 2}
+
+    print("  ✓ Sidecar exclusion + session_id scoping passed")
+
+
 def test_noise_patterns_actually_applied():
     """NOISE_PATTERNS was defined but never referenced anywhere else in the
     module (Agent-Of/miller#3) -- filter_log() only ever ran the separate
     substring-keyword check. Verify the regex patterns are now wired in."""
-    print("Test 11: NOISE_PATTERNS regex patterns are actually applied...")
+    print("Test 12: NOISE_PATTERNS regex patterns are actually applied...")
 
     content = "Real signal line.\n<function_calls>\n<invoke>fake</invoke>\n</function_calls>\nMore signal."
     filtered = NoiseFilter.filter_log(content)
@@ -431,6 +529,7 @@ def run_all_tests():
         test_clear_checkpoints,
         test_real_jsonl_discovered_and_parsed,
         test_real_jsonl_pii_redaction,
+        test_real_project_dir_ignores_sidecars_and_supports_scoping,
         test_noise_patterns_actually_applied,
     ]
 

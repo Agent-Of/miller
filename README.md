@@ -63,15 +63,20 @@ Claude Code auto-delegate to it based on its `description`.
 
 ## Quick Start
 
-Point it at a directory containing a real Claude Code session file (e.g.
-`~/.claude/projects/<project>/<session-uuid>.jsonl`) — no renaming needed,
-the file is discovered by content, not filename:
+**Investigating one specific session:** point at its `.jsonl` file directly
+(preferred), or at its project directory with `session_id=` (a real project
+directory routinely holds several unrelated sessions plus per-session
+sidecar subdirectories full of subagent transcripts — see "Directory
+Structure" below; real-session discovery never descends into
+subdirectories, and `session_id` lets you pick exactly one top-level file
+when several are present):
 
 ```python
 from slurper import create_slurper
 
-# Directory containing the real session .jsonl file(s)
-slurper = create_slurper("/path/to/.claude/projects/<project-dir>")
+# Either of these is equivalent and gives you exactly one session's data:
+slurper = create_slurper("/path/to/.claude/projects/<project-dir>/<session-uuid>.jsonl")
+# slurper = create_slurper("/path/to/.claude/projects/<project-dir>", session_id="<session-uuid>")
 
 # Stream through compactions (real compact_boundary-delimited segments)
 for chunk in slurper.slurp(resume=True):
@@ -91,6 +96,13 @@ for chunk in slurper.slurp(resume=True):
         print(f"  Open: {thread.description}")
 ```
 
+**Investigating a whole project's history:** point at the project directory
+with no `session_id` — every top-level real session file it holds is
+processed (each chunk's `source_files` says which one it came from; totals
+are never silently merged across the tool's own summary()/consumer code
+unless you sum them yourself, same as summing across any other multi-file
+result).
+
 ## API Reference
 
 ### AgentSlurper
@@ -99,8 +111,9 @@ Main class for streaming agent compactions.
 
 ```python
 slurper = AgentSlurper(
-    agent_dir: str,                    # Root directory of agent logs
-    checkpoint_dir: Optional[str] = None  # Where to store checkpoints
+    agent_dir: str,                    # A specific real session .jsonl file, OR a directory of agent logs
+    checkpoint_dir: Optional[str] = None,  # Where to store checkpoints
+    session_id: Optional[str] = None,  # When agent_dir is a directory, scope to `<session_id>.jsonl`
 )
 ```
 
@@ -223,21 +236,44 @@ Checkpoints are stored as JSON in `.checkpoints/slurper_checkpoint.json`:
 Two source kinds are discovered, and can coexist in the same directory:
 
 **Real Claude Code sessions** (the primary, intended use case): any
-`.jsonl` file under `agent_dir` (searched recursively) that sniffs as a
-real session transcript — i.e. its first few lines parse as JSON with a
-recognized `type` (`user`/`assistant`/`system`/...). Filename is
+`.jsonl` file at the **top level** of `agent_dir` (real-session discovery
+deliberately never descends into subdirectories — see below) that sniffs
+as a real session transcript — i.e. its first few lines parse as JSON with
+a recognized `type` (`user`/`assistant`/`system`/...). Filename is
 irrelevant; a real session file is named by session UUID, e.g.:
 
 ```
-agent_dir/
-└── 6ff45d9a-8628-4005-8063-402692a24a94.jsonl   # discovered by content, not name
+agent_dir/                                          # a real ~/.claude/projects/<project> dir
+├── 6ff45d9a-8628-4005-8063-402692a24a94.jsonl       # a real session -- discovered by content, not name
+├── 19443bb8-9add-42af-bb02-6d781aeff57d.jsonl       # a DIFFERENT, unrelated real session in the same project
+└── 6ff45d9a-8628-4005-8063-402692a24a94/            # per-session sidecar dir, named after the session above
+    └── subagents/
+        └── agent-a03d1e17efa814b0f.jsonl            # a subagent transcript -- NEVER pooled into any session's data
 ```
+
+This is real, observed structure, not a hypothetical: a Claude Code
+project directory accumulates one top-level `.jsonl` per session ever run
+in it (often many, entirely unrelated to each other), plus a
+per-session sidecar subdirectory holding subagent transcripts and
+tool-results. **An earlier version of this fix (found during the Org
+Lead's own dogfooding of it) recursed into those sidecar directories and
+silently pooled every subagent transcript, and every unrelated sibling
+session, into one combined total** — on a real project this meant ~8,000
+extra events and a fabricated entrypoint value that didn't exist anywhere
+in the session actually being asked about. Real-session discovery is now
+strictly top-level-only, and pointing at a directory with multiple
+top-level sessions processes each independently (never merges their
+entrypoint/event tallies into each other) — use `session_id=` or point
+directly at one file when you mean one specific session (see Quick Start).
 
 Compaction segments come from each file's own `compact_boundary` events,
 in file order — a file with N boundaries yields N+1 segments (the last one
-still open). Multiple real files in one directory are processed in
-mtime order, each contributing its own segments to one continuous,
-monotonically-numbered checkpoint sequence.
+still open); the boundary event itself counts as the final event of the
+segment it closes (verified to reconcile exactly, event-for-event and
+entrypoint-for-entrypoint, against an independent, differently-implemented
+JSONL parser on the same real file). Multiple real files in one directory
+are processed in mtime order, each contributing its own segments to one
+continuous, monotonically-numbered checkpoint sequence.
 
 **Legacy plain-text mock format** (kept for backward compatibility with
 the bundled demo/tests, not what a real session looks like): `.log`/`.txt`/
@@ -320,16 +356,19 @@ except OSError as e:
 ## Testing
 
 ```bash
-python test_slurper.py       # 11 tests: 8 legacy-format + 3 real-JSONL
+python test_slurper.py       # 12 tests: 8 legacy-format + 4 real-JSONL
 python demo_with_mock_data.py  # legacy mock-data demo, unchanged behavior
 ```
 
-The 3 real-JSONL tests cover: discovery + compact_boundary segmentation of
-a UUID-named session file with no special naming, PII redaction on real
-`json.loads`-decoded text, and — the actual regression test for the
-original bug — that a tool-call's JSON `input` containing signal-shaped
-substrings ("Accomplishment:", "completed") never leaks into extracted
-signal, only real message text does.
+The 4 real-JSONL tests cover: discovery + compact_boundary segmentation of
+a UUID-named session file with no special naming; PII redaction on real
+`json.loads`-decoded text; a directory holding multiple unrelated
+top-level sessions plus a per-session sidecar subdirectory full of
+subagent transcripts, verifying the sidecar is never pooled in and that
+`session_id=`/a direct file path correctly scope to one session; and —
+the original regression test — that a tool-call's JSON `input` containing
+signal-shaped substrings ("Accomplishment:", "completed") never leaks
+into extracted signal, only real message text does.
 
 These are still synthetic (small, hand-built) real-shaped JSONL, not a
 committed real transcript — session files are a real person's/agent's

@@ -52,34 +52,71 @@ from models import CompactionChunk, ContinuityThread, Decision, WorkProduct
 class AgentSlurper:
     """Streaming agent compaction slurper."""
 
-    def __init__(self, agent_dir: str, checkpoint_dir: Optional[str] = None):
+    def __init__(
+        self,
+        agent_dir: str,
+        checkpoint_dir: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ):
         """
         Initialize the slurper.
 
         Args:
-            agent_dir: Root directory containing agent's session logs and artifacts
-            checkpoint_dir: Directory for checkpoint files (defaults to agent_dir/.checkpoints)
+            agent_dir: Either (a) the path to one specific real Claude Code
+                session `.jsonl` file, or (b) a directory containing agent
+                session logs. A real Claude Code project directory
+                routinely holds MANY unrelated top-level session files
+                (past, separate conversations) plus per-session sidecar
+                subdirectories (named after a session UUID, holding
+                subagent transcripts / tool-results -- internal plumbing,
+                never additional top-level sessions). Passing a directory
+                processes every top-level real session file found in it
+                (each contributing its own independently-tagged segments,
+                never merged together) -- pass a specific file, or set
+                `session_id`, when you mean one particular session.
+                Sidecar subdirectories are never descended into for real
+                session discovery (a real fix for a real bug: they used
+                to be, silently pooling unrelated subagent transcripts and
+                other sessions' data into the total -- Agent-Of/miller#3
+                follow-up, found during dogfooding of this very rewrite).
+            checkpoint_dir: Directory for checkpoint files (defaults to agent_dir/.checkpoints,
+                or the parent directory's .checkpoints when agent_dir is a file)
+            session_id: When agent_dir is a directory, restrict real-session
+                discovery to the single top-level file named
+                `<session_id>.jsonl`, ignoring any other real session files
+                present. Ignored when agent_dir is already a specific file.
         """
-        self.agent_dir = Path(agent_dir)
-        if not self.agent_dir.exists():
+        candidate = Path(agent_dir)
+        if not candidate.exists():
             raise ValueError(f"Agent directory not found: {agent_dir}")
+
+        self._explicit_file: Optional[Path] = candidate if candidate.is_file() else None
+        self._session_id = session_id
+        self.agent_dir = candidate if candidate.is_dir() else candidate.parent
 
         if checkpoint_dir is None:
             checkpoint_dir = str(self.agent_dir / ".checkpoints")
 
         self.checkpoint_manager = CheckpointManager(checkpoint_dir)
+        self._sources = self._discover_sources()
         self.total_bytes = self._calculate_total_bytes()
 
     def _calculate_total_bytes(self) -> int:
-        """Calculate total bytes in all log files."""
+        """Total bytes across only the files actually discovered as sources
+        (not a blind directory walk) -- used solely as the checkpoint
+        progress-percent denominator."""
         total = 0
-        for root, dirs, files in os.walk(self.agent_dir):
-            for file in files:
-                if file.endswith((".log", ".txt", ".md", ".jsonl")):
-                    try:
-                        total += os.path.getsize(os.path.join(root, file))
-                    except OSError:
-                        pass
+        for path in self._sources["real"]:
+            try:
+                total += os.path.getsize(path)
+            except OSError:
+                pass
+        for paths in self._sources["legacy"].values():
+            for path in paths:
+                try:
+                    total += os.path.getsize(path)
+                except OSError:
+                    pass
         return max(total, 1)  # Avoid division by zero
 
     # ------------------------------------------------------------------
@@ -88,8 +125,18 @@ class AgentSlurper:
 
     def _discover_sources(self) -> dict:
         """
-        Walk agent_dir and classify every candidate file as either a real
-        Claude Code session JSONL or a legacy plain-text log.
+        Classify every candidate file as either a real Claude Code session
+        JSONL or a legacy plain-text log.
+
+        Real-session discovery is deliberately TOP-LEVEL ONLY (never
+        recurses into subdirectories): a real Claude Code project directory
+        holds per-session sidecar subdirectories (named after a session
+        UUID) containing subagent transcripts and tool-results, which are
+        not additional sessions and must never be silently pooled into
+        whatever session's data the caller actually asked for. Legacy
+        (mock-format) discovery keeps its original recursive walk, since
+        that format's own convention (this library's bundled demo/tests)
+        nests logs under a `sessions/` subdirectory.
 
         Returns:
             {
@@ -100,6 +147,17 @@ class AgentSlurper:
         real_files: list[Path] = []
         legacy: dict[int, list[Path]] = {}
 
+        if self._explicit_file is not None:
+            real_files.append(self._explicit_file)
+        else:
+            for entry in sorted(self.agent_dir.iterdir()):
+                if not entry.is_file() or not entry.name.endswith(".jsonl"):
+                    continue
+                if self._session_id is not None and entry.stem != self._session_id:
+                    continue
+                if looks_like_real_session(entry):
+                    real_files.append(entry)
+
         for root, dirs, files in os.walk(self.agent_dir):
             if ".checkpoints" in Path(root).parts:
                 continue
@@ -107,11 +165,15 @@ class AgentSlurper:
                 if not file.endswith((".log", ".txt", ".md", ".jsonl")):
                     continue
                 path = Path(root) / file
-
+                if path in real_files:
+                    continue  # already claimed by the top-level real-session scan
                 if file.endswith(".jsonl") and looks_like_real_session(path):
-                    real_files.append(path)
+                    # A real-shaped session file sitting somewhere other than
+                    # agent_dir's top level (e.g. a sidecar subagent
+                    # transcript). Deliberately not added to `real_files` --
+                    # see the docstring above -- and just as deliberately
+                    # not misclassified as a legacy compaction either.
                     continue
-
                 compaction_num = self._extract_compaction_number(str(path))
                 if compaction_num is not None:
                     legacy.setdefault(compaction_num, []).append(path)
@@ -211,17 +273,34 @@ class AgentSlurper:
         Stream one real session JSONL file, yielding one compaction segment
         at a time: (events, total_bytes, boundary_event_or_None).
 
-        A segment ends either at a compact_boundary event (boundary_event
-        is that event; it is NOT included in `events`) or at end-of-file
-        (boundary_event is None). Streams the file line-by-line -- a
-        segment's events are buffered in memory, but the whole file never
-        is, which matters for real transcripts that can run hundreds of MB.
+        A segment ends either at a compact_boundary event or at
+        end-of-file (boundary_event is None in the latter case). The
+        boundary event itself IS included as the last element of `events`
+        for the segment it closes (it's chronologically the final event of
+        that segment -- the compaction happened at that point) -- so
+        `len(events)` and per-event tallies (entrypoint counts, etc.) count
+        every real line in the file exactly once, matching the plain
+        "count every JSON line" convention other tools use (verified
+        against session-ops.js, a separate independently-built parser, on
+        the same real file: segment-sum event/entrypoint counts now
+        reconcile exactly, not just "off by the boundary count" -- a real
+        second bug found during the Org Lead's own dogfooding pass, not
+        merely a documented convention difference). `boundary_event` is
+        still passed separately too, for boundary-specific metadata
+        (trigger/tokens/etc) -- it is simply no longer *excluded* from the
+        segment's own event accounting.
+
+        Streams the file line-by-line -- a segment's events are buffered
+        in memory, but the whole file never is, which matters for real
+        transcripts that can run hundreds of MB.
         """
         buffer: list[dict] = []
         buffer_bytes = 0
 
         for event, line_bytes in iter_jsonl_events_sized(path):
             if is_compact_boundary(event):
+                buffer.append(event)
+                buffer_bytes += line_bytes
                 yield buffer, buffer_bytes, event
                 buffer = []
                 buffer_bytes = 0
@@ -361,7 +440,7 @@ class AgentSlurper:
                 bytes_processed = checkpoint.bytes_processed
                 print(f"Resuming from compaction {start_compaction} ({checkpoint.progress_percent:.1f}% done)")
 
-        sources = self._discover_sources()
+        sources = self._sources
         if not sources["real"] and not sources["legacy"]:
             raise ValueError(f"No compaction files found in {self.agent_dir}")
 
@@ -420,15 +499,24 @@ class AgentSlurper:
         print("Checkpoints cleared")
 
 
-def create_slurper(agent_dir: str, checkpoint_dir: Optional[str] = None) -> AgentSlurper:
+def create_slurper(
+    agent_dir: str,
+    checkpoint_dir: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> AgentSlurper:
     """
     Factory function to create a slurper instance.
 
     Args:
-        agent_dir: Root directory containing agent logs and artifacts
+        agent_dir: A specific real session `.jsonl` file, or a directory
+            containing agent logs (see AgentSlurper's docstring for why
+            those two aren't the same thing for real Claude Code project
+            directories, which routinely hold several unrelated sessions).
         checkpoint_dir: Optional checkpoint directory
+        session_id: Optional -- when agent_dir is a directory, restrict to
+            the single top-level session file named `<session_id>.jsonl`.
 
     Returns:
         AgentSlurper instance
     """
-    return AgentSlurper(agent_dir, checkpoint_dir)
+    return AgentSlurper(agent_dir, checkpoint_dir, session_id=session_id)
