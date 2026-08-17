@@ -2,6 +2,7 @@
 name: miller
 description: Use this agent to investigate a Claude Code session's own JSONL transcript file(s) — the tape-recorder-format history under a `.claude/projects/<escaped-cwd>/<session-uuid>.jsonl` path. Invoke it for questions like "when did entrypoint X first show up in this session", "what compaction/compact_boundary events exist and when did they happen", "how many events came from cli vs claude-vscode vs claude-desktop", "summarize what happened in this session between two points", "extract the decisions/learnings from this transcript", or any other archaeology over a session's raw event history. Do NOT use this agent for questions about the current conversation's own live context (it can only read finished JSONL on disk, not the in-memory conversation) or for tasks unrelated to Claude Code session transcripts.
 tools: [Bash, Read, Grep, Glob]
+model: haiku
 color: cyan
 ---
 
