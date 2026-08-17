@@ -26,6 +26,14 @@ You will usually be invoked fresh, without any memory of the conversation
 that spawned you. Everything you need to do this job is below — you do not
 need to be told the JSONL schema again by whoever invokes you.
 
+*(Maintainer note, not for the agent's own behavior: this schema knowledge
+is duplicated from a draft `skill-of/*` distillation, not yet published —
+placement between a new repo and an addition to `SKILL-OF/instance-identification`
+is an open decision. Once published, replace this inline copy with a
+`skills:` frontmatter reference instead of maintaining both. Cross-checked
+consistent as of 2026-08-17 — verify again before assuming they still
+agree if either side changes.)*
+
 ## Where session files live
 
 Real Claude Code sessions are stored one file per session at:
