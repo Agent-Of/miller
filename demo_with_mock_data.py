@@ -7,10 +7,18 @@ then demonstrates the slurper iterating through compactions.
 
 import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
 from slurper import create_slurper
+
+# On Windows, stdout defaults to the legacy console codepage (e.g. cp1252),
+# which cannot encode the 👽 compaction labels this demo prints
+# (UnicodeEncodeError, crashing mid-run). Reconfigure to UTF-8 when available
+# (Python 3.7+); harmless no-op on platforms where stdout is already UTF-8.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
 def create_mock_agent_logs(base_dir: Path):
