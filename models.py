@@ -67,6 +67,16 @@ class CompactionChunk:
     raw_log_length: int = 0  # bytes of original log before filtering
     checkpoint_path: Optional[str] = None
 
+    # Real-session provenance (populated only when source_kind == "real_jsonl";
+    # added as part of the JSONL-ingestion rewrite, Agent-Of/miller#3)
+    source_kind: str = "legacy_text"  # "real_jsonl" | "legacy_text"
+    source_files: list[str] = field(default_factory=list)
+    event_count: int = 0
+    entrypoints: dict = field(default_factory=dict)  # {"cli": 12, "claude-vscode": 3, ...}
+    boundary_trigger: Optional[str] = None  # "auto" | "manual" | None if chunk ended at EOF, not a boundary
+    tokens_pre: Optional[int] = None
+    tokens_post: Optional[int] = None
+
     def summary(self) -> str:
         """Generate a text summary of this compaction chunk."""
         lines = [
@@ -77,6 +87,16 @@ class CompactionChunk:
 
         if self.session_summary:
             lines.append(f"Summary: {self.session_summary}")
+            lines.append("")
+
+        if self.source_kind == "real_jsonl":
+            lines.append(
+                f"Real session data: {self.event_count} events, "
+                f"entrypoints={self.entrypoints}, "
+                f"boundary_trigger={self.boundary_trigger}"
+            )
+            if self.tokens_pre is not None or self.tokens_post is not None:
+                lines.append(f"  Tokens: pre={self.tokens_pre} post={self.tokens_post}")
             lines.append("")
 
         if self.key_accomplishments:
